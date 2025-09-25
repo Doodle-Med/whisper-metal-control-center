@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Whisper Metal Control Center</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <main class="layout">
+    <header class="hero">
+      <div>
+        <h1>Whisper Metal Control Center</h1>
+        <p>Ultra-fast transcription on Apple Silicon with optional cloud offload, batch queueing, and export-ready captions.</p>
+      </div>
+      <div class="badge">Metal&nbsp;+&nbsp;Core ML Ready</div>
+    </header>
+
+    <form id="jobForm" class="panel">
+      <h2>Engine &amp; Model</h2>
+      <div class="grid two">
+        <label class="field">
+          <span>Engine</span>
+          <select id="engineSelect" name="engine">
+            <option value="local" selected>Local (Apple Metal)</option>
+            <option value="openai">OpenAI Whisper API</option>
+            <option value="gemini">Gemini (coming soon)</option>
+          </select>
+          <small>Switch to cloud for offloading heavy queues.</small>
+        </label>
+        <label class="field">
+          <span>Local Model</span>
+          <select id="modelSelect" name="model"></select>
+          <small id="modelMeta">Loading models…</small>
+        </label>
+      </div>
+
+      <div class="grid three">
+        <label class="field">
+          <span>Language</span>
+          <input type="text" id="languageInput" name="language" value="auto" placeholder="auto">
+          <small>ISO-639-1 code or <code>auto</code>.</small>
+        </label>
+        <label class="field">
+          <span>Quality Preset</span>
+          <select id="presetSelect">
+            <option value="balanced" selected>Balanced</option>
+            <option value="speed">Fastest</option>
+            <option value="accuracy">Max Accuracy</option>
+          </select>
+          <small>Applies tuned decoding settings.</small>
+        </label>
+        <label class="field">
+          <span>Temperature</span>
+          <input type="range" id="temperatureInput" name="temperature" min="0" max="1" step="0.05" value="0">
+          <div class="range-output"><output id="temperatureValue">0.00</output></div>
+        </label>
+      </div>
+
+      <div class="grid three">
+        <label class="field">
+          <span>Beam Size</span>
+          <input type="number" id="beamSizeInput" name="beam_size" min="1" max="10" value="1">
+        </label>
+        <label class="field">
+          <span>Best Of</span>
+          <input type="number" id="bestOfInput" name="best_of" min="1" max="10" value="1">
+        </label>
+        <label class="field">
+          <span>Initial Prompt</span>
+          <input type="text" id="promptInput" name="initial_prompt" placeholder="Optional context">
+        </label>
+      </div>
+
+      <fieldset class="toggles">
+        <legend>Enhancements</legend>
+        <label><input type="checkbox" id="translateToggle" name="translate"> Translate to English</label>
+        <label><input type="checkbox" id="vadToggle" name="vad"> Enable Voice Activity Detection</label>
+        <label><input type="checkbox" id="diarizeToggle" name="diarize"> Speaker diarization</label>
+        <label><input type="checkbox" id="tinydiarizeToggle" name="tinydiarize"> TinyDiarize</label>
+        <label><input type="checkbox" id="noTimestampsToggle" name="no_timestamps"> Drop timestamps</label>
+        <label><input type="checkbox" id="cleanFillersToggle" name="cleaners" value="remove_fillers"> Clean filler words</label>
+        <label><input type="checkbox" id="detectLanguageToggle" name="detect_language"> Report detected language</label>
+      </fieldset>
+
+      <fieldset class="output-formats">
+        <legend>Output Formats</legend>
+        <label><input type="checkbox" class="formatToggle" value="txt" checked> TXT</label>
+        <label><input type="checkbox" class="formatToggle" value="srt" checked> SRT</label>
+        <label><input type="checkbox" class="formatToggle" value="vtt"> VTT</label>
+        <label><input type="checkbox" class="formatToggle" value="json" checked> JSON</label>
+      </fieldset>
+
+      <div class="grid two" id="cloudOptions" hidden>
+        <label class="field">
+          <span>Cloud Model</span>
+          <input type="text" id="cloudModelInput" name="cloud_model" value="whisper-1">
+          <small>OpenAI: whisper-1 / whisper-large-v3</small>
+        </label>
+        <label class="field">
+          <span>API Key</span>
+          <input type="password" id="cloudKeyInput" name="cloud_api_key" placeholder="sk-••••">
+          <small>Not stored on disk; sent only with this request.</small>
+        </label>
+      </div>
+
+      <section class="upload-zone" id="dropzone">
+        <input type="file" id="fileInput" name="files" accept="audio/*" multiple hidden>
+        <p><strong>Drop audio here</strong> or <button type="button" id="browseButton">Browse</button></p>
+        <p class="hint">Queue multiple files at once—Metal will crunch them in parallel batches.</p>
+        <ul id="queuedFiles"></ul>
+      </section>
+
+      <div class="actions">
+        <button type="submit" id="startButton">Start Transcription</button>
+        <button type="button" id="recordButton">Record Quick Note</button>
+        <span id="statusMessage" role="alert"></span>
+      </div>
+    </form>
+
+    <section class="panel" id="queuePanel">
+      <header class="panel-header">
+        <h2>Job Queue</h2>
+        <button type="button" id="refreshJobsButton">Refresh</button>
+      </header>
+      <div class="table-wrapper">
+        <table>
+          <thead>
+            <tr>
+              <th>Job</th>
+              <th>Status</th>
+              <th>Progress</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody id="jobTableBody">
+            <tr class="empty">
+              <td colspan="4">No jobs yet. Add files and press <em>Start Transcription</em>.</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="panel" id="transcriptPanel">
+      <header class="panel-header">
+        <div>
+          <h2 id="transcriptTitle">Transcript Viewer</h2>
+          <small id="transcriptMeta">Select a completed job to inspect the output.</small>
+        </div>
+        <div class="downloads" id="downloadButtons"></div>
+      </header>
+      <article id="transcriptOutput" class="transcript-output">No transcript selected.</article>
+      <div class="segments" id="segmentsContainer"></div>
+    </section>
+  </main>
+
+  <script type="module" src="app.js"></script>
+</body>
+</html>
