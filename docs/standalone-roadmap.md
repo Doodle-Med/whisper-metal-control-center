@@ -45,11 +45,30 @@ standalone-app/build_dmg.sh                    # (optional) dist/WhisperMetalCon
    sufficient for a lightweight embed but does rely on Python + PyObjC.
 2. **Auto-updates & notarization** – add Sparkle (or similar) for updates and
    notarize/sign the bundle and DMG using an Apple Developer ID before shipping
-   to end users.
-3. **Model management** – optionally provide a UI/logic for downloading and
-   switching between ggml models within the packaged app rather than bundling
-   only `ggml-base.en.bin`.
+   to end users. See the "Notarization outline" section below.
+3. **Model management** – runtime downloader now ships with progress UI and pulls
+   `ggml-base.en.bin`, `ggml-small.en.bin`, `ggml-medium.en.bin`, and
+   `ggml-large-v3.bin` on first launch. Future work: allow advanced toggles
+   (quantized variants, pause/cancel) and expose download history.
 
 This document now tracks the future work required to polish Phase 3. The
 self-contained app bundle scaffolding lives entirely in `standalone-app/`, ready
 for deployment as its own GitHub repository.
+
+## Notarization outline
+
+**Certificates**
+- Apple Developer ID Application certificate installed in the login keychain.
+- Apple Developer ID Installer certificate (for DMG stapling if needed).
+
+**Codesign**
+- codesign PyInstaller binaries and embedded dylibs with `--deep --force --options runtime --sign "Developer ID Application: <Name>"` prior to DMG creation.
+- ensure entitlements plist allows network access and embedded python execution.
+
+**Notarize**
+- `xcrun notarytool submit dist/WhisperMetalControlCenter.dmg --apple-id <apple_id> --team-id <team_id> --password <app-specific-password> --wait`.
+- After success, `xcrun stapler staple dist/WhisperMetalControlCenter.dmg`.
+
+**Automation**
+- Add secure environment variables to CI (Apple ID, team ID, app-specific password).
+- Extend `standalone-app/build_dmg.sh` to optionally codesign and notarize when credentials are present; emit log for release notes.
