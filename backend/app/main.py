@@ -142,6 +142,29 @@ async def list_models() -> List[Dict[str, Any]]:
     return model_manager.ready_models()
 
 
+@app.get("/api/model-status")
+async def model_status() -> Dict[str, Any]:
+    if model_manager is None:  # pragma: no cover - should not happen after startup
+        return {"models": [], "error": "Model manager not initialized"}
+    state = model_manager.get_state()
+    download_dir = model_manager.download_dir
+    return {
+        "models": state,
+        "sources": list(MODEL_SOURCES.keys()),
+        "download_dir": str(download_dir),
+    }
+
+
+@app.post("/api/model-status/{name}/retry")
+async def retry_model(name: str) -> Dict[str, Any]:
+    if model_manager is None:
+        raise HTTPException(status_code=503, detail="Model manager not initialized")
+    if name not in MODEL_SOURCES:
+        raise HTTPException(status_code=404, detail="Unknown model")
+    model_manager.retry_download(name)
+    return {"status": "queued"}
+
+
 async def _monitor_model_progress() -> None:
     if model_manager is None:
         return
