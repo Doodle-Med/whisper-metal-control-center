@@ -1,3 +1,24 @@
+@app.get("/api/model-status")
+async def model_status() -> Dict[str, Any]:
+    if model_manager is None:
+        return {"models": [], "error": "Model manager not initialized"}
+    state = model_manager.get_state()
+    download_dir = model_manager.download_dir
+    return {
+        "models": state,
+        "sources": list(MODEL_SOURCES.keys()),
+        "download_dir": str(download_dir),
+    }
+
+
+@app.post("/api/model-status/{name}/retry")
+async def retry_model(name: str) -> Dict[str, Any]:
+    if model_manager is None:
+        raise HTTPException(status_code=503, detail="Model manager not initialized")
+    if name not in MODEL_SOURCES:
+        raise HTTPException(status_code=404, detail="Unknown model")
+    model_manager.retry_download(name)
+    return {"status": "queued"}
 from __future__ import annotations
 
 import asyncio
@@ -18,11 +39,14 @@ from . import audio
 from .cloud import CloudTranscriptionError, transcribe_gemini, transcribe_openai
 from .config import settings
 from .jobs import job_manager
+from .model_downloader import ModelDownloadManager, MODEL_SOURCES
 from .models import CapabilityResponse, JobDetail, JobStatus, JobSummary, ModelInfo
 from .postprocess import apply_cleaners
 from .whisper_runner import TranscriptionOptions, WhisperRuntimeError, runner
 
 app = FastAPI(title="Whisper Metal Control Center", version="0.2.0")
+
+model_manager: Optional[ModelDownloadManager] = None
 
 app.add_middleware(
     CORSMiddleware,
@@ -94,11 +118,34 @@ def resolve_optional_path(name: str | None) -> Optional[Path]:
 
 @app.on_event("startup")
 async def startup_event() -> None:
+    global model_manager
+
     settings.storage_dir.mkdir(parents=True, exist_ok=True)
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     JOB_DIR.mkdir(parents=True, exist_ok=True)
     ARCHIVE_JOBS_DIR.mkdir(parents=True, exist_ok=True)
     GROUP_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Initialize model manager with both vendor and per-user paths
+    search_dirs = [settings.models_dir]
+    user_models_dir_env = os.environ.get("WHISPER_APP_USER_MODELS_DIR")
+    if user_models_dir_env:
+        search_dirs.append(Path(user_models_dir_env).expanduser())
+    download_dir = (
+        Path(user_models_dir_env).expanduser()
+        if user_models_dir_env
+        else settings.models_dir
+    )
+    model_manager = ModelDownloadManager(
+        search_dirs=[path for path in search_dirs if path],
+        download_dir=download_dir,
+    )
+
+    # Ensure primary model starts downloading quickly; do not block startup.
+    model_manager.ensure_base_model(blocking=False)
+    model_manager.download_missing_async()
+    asyncio.create_task(_monitor_model_progress())
+
     loaded_groups = _load_groups_from_disk()
     for group_id in loaded_groups:
         await _refresh_group(group_id)
@@ -111,72 +158,37 @@ async def health() -> dict[str, str]:
 
 @app.get("/api/models")
 async def list_models() -> List[Dict[str, Any]]:
+    if model_manager is None:  # pragma: no cover - should not happen after startup
+        return []
+    return model_manager.ready_models()
+
+
+async def _monitor_model_progress() -> None:
+    if model_manager is None:
+        return
+    # Periodically log progress to help diagnose slow downloads when running headless.
     try:
-        models: list[Dict[str, Any]] = []
-        seen: set[str] = set()
-
-        # Search both the bundled vendor models directory and the per-user models directory used by the app bundle
-        search_dirs: list[Path] = []
-        if settings.models_dir.exists():
-            search_dirs.append(settings.models_dir)
-
-        user_models_env = os.environ.get("WHISPER_APP_USER_MODELS_DIR")
-        if user_models_env:
-            user_models_dir = Path(user_models_env).expanduser().resolve()
-        else:
-            user_models_dir = (
-                Path.home()
-                / "Library"
-                / "Application Support"
-                / "WhisperMetalControlCenter"
-                / "models"
-            )
-        if user_models_dir.exists():
-            search_dirs.append(user_models_dir)
-
-        for directory in search_dirs:
-            for path in sorted(directory.glob("*.bin")):
-                try:
-                    if path.stem.startswith("for-tests"):
-                        continue
-                    resolved = str(path.resolve())
-                    if resolved in seen:
-                        continue
-                    seen.add(resolved)
-                    size_mb = round(path.stat().st_size / (1024 * 1024), 2)
-                    quant = None
-                    if "q" in path.stem:
-                        parts = path.stem.split("-")
-                        quant = parts[-1] if parts else None
-                    models.append(
-                        {
-                            "name": path.name,
-                            "path": resolved,
-                            "size_mb": size_mb,
-                            "quantization": quant,
-                        }
-                    )
-                except Exception:
-                    # Skip unreadable files
-                    continue
-        if models:
-            return models
-        # Fallback to environment default model if present
-        env_model = os.environ.get("WHISPER_APP_WHISPER_MODEL")
-        if env_model and Path(env_model).exists():
-            p = Path(env_model)
-            return [
-                {
-                    "name": p.name,
-                    "path": str(p.resolve()),
-                    "size_mb": round(p.stat().st_size / (1024 * 1024), 2),
-                    "quantization": None,
-                }
-            ]
-        return []
-    except Exception:
-        # Never 500 here; return empty list so UI can still initialize
-        return []
+        while True:
+            await asyncio.sleep(2)
+            state = model_manager.get_state()
+            pending = [name for name, info in state.items() if info.get("status") == "downloading"]
+            if not pending:
+                # Once everything is ready, stop logging.
+                break
+            summary = []
+            for name in pending:
+                info = state[name]
+                total = info.get("total_bytes")
+                downloaded = info.get("bytes_downloaded", 0) or 0
+                percent = (downloaded / total * 100) if total else None
+                summary.append(
+                    f"{name}: {downloaded / 1_048_576:.1f} MiB"
+                    + (f"/{total / 1_048_576:.1f} MiB ({percent:.1f}%)" if total else "")
+                )
+            if summary:
+                print("[model-download] " + "; ".join(summary))
+    except asyncio.CancelledError:  # pragma: no cover
+        pass
 
 
 @app.get("/api/capabilities", response_model=CapabilityResponse)

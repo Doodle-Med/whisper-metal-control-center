@@ -48,6 +48,8 @@ const transcriptMeta = document.getElementById("transcriptMeta");
 const transcriptOutput = document.getElementById("transcriptOutput");
 const segmentsContainer = document.getElementById("segmentsContainer");
 const downloadButtons = document.getElementById("downloadButtons");
+const modelStatus = document.getElementById("modelStatus");
+let modelPollHandle = null;
 
 const formatToggles = Array.from(document.querySelectorAll(".formatToggle"));
 
@@ -57,6 +59,7 @@ window.addEventListener("DOMContentLoaded", () => {
 
 async function initialize() {
   try {
+    startModelPolling();
     await loadCapabilities();
     await refreshJobs();
     attachEventListeners();
@@ -65,6 +68,86 @@ async function initialize() {
   } catch (error) {
     console.error(error);
     showStatus(`Failed to initialize: ${error.message || error}`, "error");
+  }
+}
+
+function startModelPolling() {
+  if (modelPollHandle) return;
+  pollModelStatus();
+  modelPollHandle = window.setInterval(pollModelStatus, 2000);
+}
+
+async function pollModelStatus() {
+  try {
+    const response = await fetch("/api/model-status");
+    if (!response.ok) throw new Error("Unable to fetch model status");
+    const payload = await response.json();
+    renderModelStatus(payload.models || {});
+  } catch (error) {
+    console.error(error);
+  }
+}
+
+function renderModelStatus(state) {
+  if (!modelStatus) return;
+  const entries = Object.entries(state);
+  if (!entries.length) {
+    modelStatus.innerHTML = "<p class='status-note'>Checking models…</p>";
+    return;
+  }
+
+  const list = document.createElement("ul");
+  list.className = "model-status-list";
+
+  let hasActiveDownload = false;
+
+  entries.forEach(([name, info]) => {
+    const item = document.createElement("li");
+    const status = info.status;
+    const bytes = info.bytes_downloaded || 0;
+    const total = info.total_bytes;
+    const progress = typeof info.progress === "number" ? Math.round(info.progress * 100) : null;
+
+    let label = `<strong>${name}</strong>`;
+    if (status === "ready") {
+      label += " • Ready";
+    } else if (status === "downloading") {
+      hasActiveDownload = true;
+      const downloadedMB = (bytes / (1024 * 1024)).toFixed(1);
+      const totalMB = total ? (total / (1024 * 1024)).toFixed(1) : "?";
+      label += ` • Downloading ${downloadedMB} / ${totalMB} MB`;
+      if (progress !== null) label += ` (${progress}%)`;
+    } else if (status === "error") {
+      label += " • Failed";
+      const button = document.createElement("button");
+      button.type = "button";
+      button.textContent = "Retry";
+      button.onclick = () => retryModelDownload(name);
+      item.appendChild(button);
+    } else {
+      label += " • Pending";
+    }
+
+    item.insertAdjacentHTML("afterbegin", `<span>${label}</span>`);
+    list.appendChild(item);
+  });
+
+  modelStatus.innerHTML = "";
+  modelStatus.appendChild(list);
+
+  if (hasActiveDownload) {
+    showStatus("Downloading models…", "info");
+  }
+}
+
+async function retryModelDownload(name) {
+  try {
+    const response = await fetch(`/api/model-status/${encodeURIComponent(name)}/retry`, { method: "POST" });
+    if (!response.ok) throw new Error("Retry failed");
+    showStatus(`Retrying download for ${name}.`, "info");
+  } catch (error) {
+    console.error(error);
+    showStatus(`Retry failed: ${error.message || error}`, "error");
   }
 }
 
