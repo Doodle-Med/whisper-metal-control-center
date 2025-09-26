@@ -48,7 +48,13 @@ fi
 
 mkdir -p "${RESOURCES_DIR}/vendor/whisper.cpp"
 rsync -a --delete "${REPO_ROOT}/vendor/whisper.cpp/build" "${RESOURCES_DIR}/vendor/whisper.cpp/"
-rsync -a "${REPO_ROOT}/vendor/whisper.cpp/models" "${RESOURCES_DIR}/vendor/whisper.cpp/"
+# Do not bundle any model files; the launcher will download on first run
+mkdir -p "${RESOURCES_DIR}/vendor/whisper.cpp/models"
+# Optionally include upstream download helper for reference
+if [[ -f "${REPO_ROOT}/vendor/whisper.cpp/models/download-ggml-model.sh" ]]; then
+  rsync -a "${REPO_ROOT}/vendor/whisper.cpp/models/download-ggml-model.sh" "${RESOURCES_DIR}/vendor/whisper.cpp/models/"
+  chmod +x "${RESOURCES_DIR}/vendor/whisper.cpp/models/download-ggml-model.sh"
+fi
 
 FFMPEG_PATH="$(command -v ffmpeg || true)"
 if [[ -n "${FFMPEG_PATH}" ]]; then

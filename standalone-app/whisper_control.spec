@@ -32,7 +32,7 @@ resources = [
     (str(ROOT / "frontend"), "frontend"),
     (str(ROOT / "scripts"), "scripts"),
     (str(ROOT / "vendor" / "whisper.cpp" / "build"), "vendor/whisper.cpp/build"),
-    (str(ROOT / "vendor" / "whisper.cpp" / "models"), "vendor/whisper.cpp/models"),
+    # Models are copied post-build by build_app_bundle.sh (base model only) to keep size small
     (str(ROOT / "README.md"), "docs"),
 ]
 

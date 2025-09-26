@@ -48,6 +48,53 @@ def configure_environment() -> tuple[Path, Path, Path]:
     return resources_root, project_root, vendor_root
 
 
+def _download_file(url: str, destination: Path, chunk_size: int = 1024 * 1024) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with requests.get(url, stream=True, timeout=30) as response:
+        response.raise_for_status()
+        with destination.open("wb") as file_handle:
+            for chunk in response.iter_content(chunk_size=chunk_size):
+                if chunk:
+                    file_handle.write(chunk)
+
+
+def ensure_base_model(vendor_root: Path, model_name: str = "ggml-base.en.bin") -> Optional[Path]:
+    models_dir = vendor_root / "models"
+    model_path = models_dir / model_name
+    if model_path.exists():
+        return model_path
+
+    # Try to download from known mirrors. We prefer Hugging Face; fall back to ggml mirror.
+    candidate_urls = [
+        f"https://huggingface.co/ggerganov/whisper.cpp/resolve/main/{model_name}?download=true",
+        f"https://ggml.ggerganov.com/whisper/{model_name}",
+    ]
+
+    for url in candidate_urls:
+        try:
+            _download_file(url, model_path)
+            break
+        except Exception:
+            # Try the next mirror
+            continue
+
+    if not model_path.exists():
+        # As a last resort, try the bundled shell helper if present
+        helper = models_dir / "download-ggml-model.sh"
+        if helper.exists():
+            try:
+                import subprocess
+
+                subprocess.run(["bash", str(helper), "base.en"], check=True, cwd=str(models_dir))
+            except Exception:
+                pass
+
+    if model_path.exists():
+        os.environ.setdefault("WHISPER_APP_WHISPER_MODEL", str(model_path))
+        return model_path
+    return None
+
+
 class BackendServer:
     def __init__(self, host: str = "127.0.0.1", port: int = 8777) -> None:
         self.host = host
@@ -98,6 +145,11 @@ class BackendServer:
 
 def main() -> None:
     resources_root, project_root, vendor_root = configure_environment()
+
+    # Ensure a minimal model is present so the app works out of the box. If download fails,
+    # the app will still launch; the user can point to a model later.
+    with contextlib.suppress(Exception):
+        ensure_base_model(vendor_root)
 
     backend = BackendServer()
     backend.start()
