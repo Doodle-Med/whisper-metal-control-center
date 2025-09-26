@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import shutil
+import os
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -108,59 +109,97 @@ async def health() -> dict[str, str]:
     return {"status": "ok", "time": datetime.utcnow().isoformat()}
 
 
-@app.get("/api/models", response_model=List[ModelInfo])
-async def list_models() -> List[ModelInfo]:
-    models: list[ModelInfo] = []
-    seen: set[str] = set()
+@app.get("/api/models")
+async def list_models() -> List[Dict[str, Any]]:
+    try:
+        models: list[Dict[str, Any]] = []
+        seen: set[str] = set()
 
-    # Search both the bundled vendor models directory and the per-user models directory used by the app bundle
-    search_dirs: list[Path] = []
-    if settings.models_dir.exists():
-        search_dirs.append(settings.models_dir)
+        # Search both the bundled vendor models directory and the per-user models directory used by the app bundle
+        search_dirs: list[Path] = []
+        if settings.models_dir.exists():
+            search_dirs.append(settings.models_dir)
 
-    user_models_env = os.environ.get("WHISPER_APP_USER_MODELS_DIR")
-    if user_models_env:
-        user_models_dir = Path(user_models_env).expanduser().resolve()
-    else:
-        user_models_dir = Path.home() / "Library" / "Application Support" / "WhisperMetalControlCenter" / "models"
-    if user_models_dir.exists():
-        search_dirs.append(user_models_dir)
+        user_models_env = os.environ.get("WHISPER_APP_USER_MODELS_DIR")
+        if user_models_env:
+            user_models_dir = Path(user_models_env).expanduser().resolve()
+        else:
+            user_models_dir = (
+                Path.home()
+                / "Library"
+                / "Application Support"
+                / "WhisperMetalControlCenter"
+                / "models"
+            )
+        if user_models_dir.exists():
+            search_dirs.append(user_models_dir)
 
-    for directory in search_dirs:
-        for path in sorted(directory.glob("*.bin")):
-            try:
-                if path.stem.startswith("for-tests"):
-                    continue
-                resolved = str(path.resolve())
-                if resolved in seen:
-                    continue
-                seen.add(resolved)
-                size_mb = round(path.stat().st_size / (1024 * 1024), 2)
-                quant = None
-                if "q" in path.stem:
-                    parts = path.stem.split("-")
-                    quant = parts[-1] if parts else None
-                models.append(
-                    ModelInfo(
-                        name=path.name,
-                        path=resolved,
-                        size_mb=size_mb,
-                        quantization=quant,
+        for directory in search_dirs:
+            for path in sorted(directory.glob("*.bin")):
+                try:
+                    if path.stem.startswith("for-tests"):
+                        continue
+                    resolved = str(path.resolve())
+                    if resolved in seen:
+                        continue
+                    seen.add(resolved)
+                    size_mb = round(path.stat().st_size / (1024 * 1024), 2)
+                    quant = None
+                    if "q" in path.stem:
+                        parts = path.stem.split("-")
+                        quant = parts[-1] if parts else None
+                    models.append(
+                        {
+                            "name": path.name,
+                            "path": resolved,
+                            "size_mb": size_mb,
+                            "quantization": quant,
+                        }
                     )
-                )
-            except Exception:
-                # Skip unreadable files
-                continue
-    return models
+                except Exception:
+                    # Skip unreadable files
+                    continue
+        if models:
+            return models
+        # Fallback to environment default model if present
+        env_model = os.environ.get("WHISPER_APP_WHISPER_MODEL")
+        if env_model and Path(env_model).exists():
+            p = Path(env_model)
+            return [
+                {
+                    "name": p.name,
+                    "path": str(p.resolve()),
+                    "size_mb": round(p.stat().st_size / (1024 * 1024), 2),
+                    "quantization": None,
+                }
+            ]
+        return []
+    except Exception:
+        # Never 500 here; return empty list so UI can still initialize
+        return []
 
 
 @app.get("/api/capabilities", response_model=CapabilityResponse)
 async def capabilities() -> CapabilityResponse:
+    raw_models = await list_models()
+    models: list[ModelInfo] = []
+    for item in raw_models:
+        try:
+            models.append(
+                ModelInfo(
+                    name=item["name"],
+                    path=item["path"],
+                    size_mb=float(item.get("size_mb", 0)),
+                    quantization=item.get("quantization"),
+                )
+            )
+        except Exception:
+            continue
     return CapabilityResponse(
         default_threads=settings.whisper_threads,
         max_concurrent_jobs=settings.max_concurrent_jobs,
         allow_cloud_offload=settings.allow_cloud_offload,
-        available_models=await list_models(),
+        available_models=models,
         default_formats=settings.default_output_formats,
     )
 
