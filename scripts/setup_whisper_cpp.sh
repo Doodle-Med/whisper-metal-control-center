@@ -35,11 +35,18 @@ if [[ -f ".gitmodules" ]]; then
   git submodule update --init --recursive
 fi
 
-# Build with Metal backend enabled
+# Build with Metal backend enabled. Recent macOS SDKs ship libc++ headers outside
+# the default include search path when building in custom workspaces, so we
+# explicitly point CMake at the SDK root and libc++ headers.
+SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"
+CXXFLAGS="-I${SDKROOT}/usr/include/c++/v1"
+
 mkdir -p build
 cmake -B build \
   -DGGML_METAL=1 \
-  -DCMAKE_BUILD_TYPE=Release
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_OSX_SYSROOT="$SDKROOT" \
+  -DCMAKE_CXX_FLAGS="$CXXFLAGS"
 cmake --build build --config Release -j
 
 # Download requested ggml model (stored under models/)

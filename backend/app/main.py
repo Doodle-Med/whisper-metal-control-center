@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
-from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -33,9 +33,12 @@ app.add_middleware(
 
 UPLOAD_DIR = settings.storage_dir / "uploads"
 JOB_DIR = settings.storage_dir / "jobs"
+ARCHIVE_JOBS_DIR = settings.storage_dir / "archive" / "jobs"
+GROUP_DIR = settings.storage_dir / "groups"
 job_tasks: dict[str, asyncio.Task] = {}
 job_secrets: dict[str, Dict[str, Optional[str]]] = {}
 job_semaphore = asyncio.Semaphore(max(1, settings.max_concurrent_jobs))
+group_registry: dict[str, Dict[str, Any]] = {}
 
 
 def parse_bool(value: Any, default: bool = False) -> bool:
@@ -93,6 +96,11 @@ async def startup_event() -> None:
     settings.storage_dir.mkdir(parents=True, exist_ok=True)
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     JOB_DIR.mkdir(parents=True, exist_ok=True)
+    ARCHIVE_JOBS_DIR.mkdir(parents=True, exist_ok=True)
+    GROUP_DIR.mkdir(parents=True, exist_ok=True)
+    loaded_groups = _load_groups_from_disk()
+    for group_id in loaded_groups:
+        await _refresh_group(group_id)
 
 
 @app.get("/api/health")
@@ -106,6 +114,8 @@ async def list_models() -> List[ModelInfo]:
     if not settings.models_dir.exists():
         return models
     for path in sorted(settings.models_dir.glob("*.bin")):
+        if path.stem.startswith("for-tests"):
+            continue
         size_mb = round(path.stat().st_size / (1024 * 1024), 2)
         quant = None
         if "q" in path.stem:
@@ -158,6 +168,7 @@ async def create_jobs(
     cloud_provider: str = Form("openai"),
     cloud_model: str = Form("whisper-1"),
     cloud_api_key: str | None = Form(None),
+    combine: str = Form("false"),
 ) -> JSONResponse:
     if not files:
         raise HTTPException(status_code=400, detail="No files uploaded")
@@ -168,6 +179,7 @@ async def create_jobs(
     diarize_flag = parse_bool(diarize)
     tinydiarize_flag = parse_bool(tinydiarize)
     detect_language_flag = parse_bool(detect_language)
+    combine_outputs = parse_bool(combine)
 
     temperature_value = parse_float(temperature)
     temperature_inc_value = parse_float(temperature_inc)
@@ -181,6 +193,19 @@ async def create_jobs(
     requested_cleaners = parse_list(cleaners)
 
     jobs_created: list[JobSummary] = []
+    job_ids: list[str] = []
+    group_id: Optional[str] = uuid4().hex if combine_outputs else None
+
+    if combine_outputs and group_id:
+        group_metadata = {
+            "id": group_id,
+            "job_ids": [],
+            "names": {},
+            "downloads": {},
+            "created_at": datetime.utcnow().isoformat(),
+        }
+        group_registry[group_id] = group_metadata
+        (GROUP_DIR / group_id).mkdir(parents=True, exist_ok=True)
 
     for file in files:
         if not file.filename:
@@ -225,6 +250,7 @@ async def create_jobs(
             params=params,
             output_formats=requested_formats,
             storage_dir=output_dir,
+            group_id=group_id,
         )
 
         job_secrets[job_id] = {"cloud_api_key": cloud_api_key}
@@ -239,6 +265,11 @@ async def create_jobs(
         )
         job_tasks[job_id] = task
 
+        job_ids.append(job_id)
+        if combine_outputs and group_id:
+            group_registry[group_id]["job_ids"].append(job_id)
+            group_registry[group_id]["names"][job_id] = safe_name
+
         jobs_created.append(
             JobSummary(
                 id=record.id,
@@ -248,10 +279,26 @@ async def create_jobs(
                 progress=record.progress,
                 created_at=record.created_at,
                 updated_at=record.updated_at,
+                group_id=record.group_id,
+                archived=record.archived,
             )
         )
 
-    return JSONResponse([job.model_dump(mode="json") for job in jobs_created])
+    group_payload: Optional[Dict[str, Any]] = None
+    if combine_outputs and group_id:
+        _persist_group_metadata(group_registry[group_id])
+        group_payload = {
+            "id": group_id,
+            "job_ids": list(group_registry[group_id]["job_ids"]),
+            "downloads": group_registry[group_id].get("downloads", {}),
+        }
+
+    response_payload = {
+        "jobs": [job.model_dump(mode="json") for job in jobs_created],
+        "group": group_payload,
+    }
+
+    return JSONResponse(response_payload)
 
 
 async def _process_job(job_id: str, engine: str, original_audio: Path, output_dir: Path) -> None:
@@ -306,6 +353,7 @@ async def _process_job(job_id: str, engine: str, original_audio: Path, output_di
     finally:
         job_tasks.pop(job_id, None)
         job_secrets.pop(job_id, None)
+        _cleanup_upload_file(original_audio)
 
 
 async def _run_local_job(job_id: str, original_audio: Path, output_dir: Path, params: Dict[str, Any]) -> None:
@@ -344,15 +392,7 @@ async def _run_local_job(job_id: str, original_audio: Path, output_dir: Path, pa
         output_dir=output_dir,
         progress_cb=progress_cb,
     )
-
-    downloads = {}
-    for fmt, path in result.get("artifacts", {}).items():
-        relative = path.relative_to(settings.storage_dir)
-        url = f"/api/jobs/{job_id}/download/{fmt}?path={relative.as_posix()}"
-        downloads[fmt] = url
-        await job_manager.update_download(job_id, fmt, url)
-
-    await job_manager.update_job(
+    job_record = await job_manager.update_job(
         job_id,
         lambda job: setattr(
             job,
@@ -364,6 +404,13 @@ async def _run_local_job(job_id: str, original_audio: Path, output_dir: Path, pa
             },
         ),
     )
+
+    await _recompute_job_downloads(job_id)
+
+    if job_record.group_id:
+        await _refresh_group(job_record.group_id)
+
+    _delete_if_exists(converted_audio)
 
 
 async def _run_cloud_job(job_id: str, original_audio: Path, output_dir: Path, params: Dict[str, Any]) -> None:
@@ -404,13 +451,22 @@ async def _run_cloud_job(job_id: str, original_audio: Path, output_dir: Path, pa
         "segments": cleaned_segments,
     }
 
-    await _store_cloud_outputs(job_id, output_dir, job_payload, params.get("output_formats", settings.default_output_formats))
+    await _store_cloud_outputs(
+        job_id,
+        output_dir,
+        job_payload,
+        params.get("output_formats", settings.default_output_formats),
+    )
 
-    await job_manager.update_job(
+    job_record = await job_manager.update_job(
         job_id,
         lambda job: setattr(job, "result", job_payload),
     )
+    await _recompute_job_downloads(job_id)
+    if job_record.group_id:
+        await _refresh_group(job_record.group_id)
     await job_manager.set_progress(job_id, 100)
+    _delete_if_exists(original_audio)
 
 
 async def _store_cloud_outputs(
@@ -428,13 +484,6 @@ async def _store_cloud_outputs(
     _write_srt(base.with_suffix(".srt"), segments)
     if "vtt" in formats:
         _write_vtt(base.with_suffix(".vtt"), segments)
-
-    for fmt in set(formats + ["json", "txt", "srt"]):
-        candidate = base.with_suffix(f".{fmt}")
-        if candidate.exists():
-            relative = candidate.relative_to(settings.storage_dir)
-            url = f"/api/jobs/{job_id}/download/{fmt}?path={relative.as_posix()}"
-            await job_manager.update_download(job_id, fmt, url)
 
 
 def _write_srt(path: Path, segments: List[Dict[str, Any]]) -> None:
@@ -477,10 +526,171 @@ async def _save_upload(file: UploadFile, destination: Path) -> None:
             buffer.write(chunk)
 
 
+def _delete_if_exists(path: Path) -> None:
+    try:
+        if path.is_file():
+            path.unlink(missing_ok=True)
+        elif path.is_dir():
+            shutil.rmtree(path, ignore_errors=True)
+    except Exception:  # pragma: no cover - best effort cleanup
+        pass
+
+
+def _cleanup_upload_file(original_audio: Path) -> None:
+    if not original_audio:
+        return
+    if original_audio.exists():
+        _delete_if_exists(original_audio)
+    parent = original_audio.parent
+    if parent.exists() and not any(parent.iterdir()):
+        _delete_if_exists(parent)
+
+
+def _load_groups_from_disk() -> list[str]:
+    loaded: list[str] = []
+    if not GROUP_DIR.exists():
+        return loaded
+    for metadata_path in GROUP_DIR.glob("*/metadata.json"):
+        try:
+            data = json.loads(metadata_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            continue
+        group_id = data.get("id") or metadata_path.parent.name
+        data.setdefault("job_ids", [])
+        data.setdefault("names", {})
+        data.setdefault("downloads", {})
+        data.setdefault("complete", False)
+        data.setdefault("created_at", datetime.utcnow().isoformat())
+        group_registry[group_id] = data
+        loaded.append(group_id)
+    return loaded
+
+
+def _persist_group_metadata(meta: Dict[str, Any]) -> None:
+    group_id = meta["id"]
+    group_dir = GROUP_DIR / group_id
+    group_dir.mkdir(parents=True, exist_ok=True)
+    metadata_path = group_dir / "metadata.json"
+    metadata_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+
+
+def _get_group_info(group_id: str) -> Dict[str, Any]:
+    if group_id in group_registry:
+        return group_registry[group_id]
+    metadata_path = GROUP_DIR / group_id / "metadata.json"
+    if not metadata_path.exists():
+        raise HTTPException(status_code=404, detail="Group not found")
+    data = json.loads(metadata_path.read_text(encoding="utf-8"))
+    data.setdefault("downloads", {})
+    data.setdefault("job_ids", [])
+    data.setdefault("names", {})
+    data.setdefault("complete", False)
+    group_registry[group_id] = data
+    return data
+
+
+async def _refresh_group(group_id: str) -> None:
+    meta = _get_group_info(group_id)
+    sections: list[str] = []
+    complete = True
+
+    for job_id in meta.get("job_ids", []):
+        job = job_manager.get_job(job_id)
+        if not job or not job.result:
+            complete = False
+            continue
+        title = meta.get("names", {}).get(job_id, job.filename)
+        text = (job.result or {}).get("text", "").strip()
+        section = f"=== {title} ===\n{text}".strip()
+        sections.append(section)
+
+    combined_text = "\n\n".join(section for section in sections if section).strip()
+    combined_path = GROUP_DIR / group_id / "combined.txt"
+    combined_path.parent.mkdir(parents=True, exist_ok=True)
+    combined_path.write_text(combined_text, encoding="utf-8")
+
+    meta.setdefault("downloads", {})
+    meta["downloads"]["txt"] = f"/api/groups/{group_id}/download/txt"
+    meta["complete"] = complete and bool(meta.get("job_ids"))
+    meta["updated_at"] = datetime.utcnow().isoformat()
+    group_registry[group_id] = meta
+    _persist_group_metadata(meta)
+
+
+async def _recompute_job_downloads(job_id: str) -> None:
+    def updater(job) -> None:
+        job.downloads.clear()
+        base = job.storage_dir / "transcript"
+        formats = set(job.output_formats or []) | {"json", "txt", "srt", "vtt"}
+        for fmt in formats:
+            candidate = base.with_suffix(f".{fmt}")
+            if candidate.exists():
+                relative = candidate.relative_to(settings.storage_dir)
+                job.downloads[fmt] = (
+                    f"/api/jobs/{job.id}/download/{fmt}?path={relative.as_posix()}"
+                )
+
+    await job_manager.update_job(job_id, updater)
+
+
+async def _archive_job(job_id: str) -> None:
+    job = job_manager.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if job.archived:
+        return
+    if job.status != JobStatus.completed:
+        raise HTTPException(status_code=400, detail="Only completed jobs can be archived")
+
+    destination = ARCHIVE_JOBS_DIR / job_id
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if destination.exists():
+        shutil.rmtree(destination)
+    if job.storage_dir.exists():
+        shutil.move(str(job.storage_dir), destination)
+
+    def updater(record) -> None:
+        record.storage_dir = destination
+        record.archived = True
+
+    await job_manager.update_job(job_id, updater)
+    await _recompute_job_downloads(job_id)
+
+
+async def _unarchive_job(job_id: str) -> None:
+    job = job_manager.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if not job.archived:
+        return
+
+    destination = JOB_DIR / job_id
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if destination.exists():
+        shutil.rmtree(destination)
+    if job.storage_dir.exists():
+        shutil.move(str(job.storage_dir), destination)
+
+    def updater(record) -> None:
+        record.storage_dir = destination
+        record.archived = False
+
+    await job_manager.update_job(job_id, updater)
+    await _recompute_job_downloads(job_id)
+
+
+async def _archive_completed_jobs() -> int:
+    count = 0
+    for job in job_manager.list_jobs(archived=False):
+        if job.status == JobStatus.completed:
+            await _archive_job(job.id)
+            count += 1
+    return count
+
 @app.get("/api/jobs", response_model=List[JobDetail])
-async def list_jobs_endpoint() -> List[JobDetail]:
+async def list_jobs_endpoint(archived: bool = Query(False)) -> List[JobDetail]:
     results: list[JobDetail] = []
-    for job in job_manager.list_jobs():
+    for job in job_manager.list_jobs(archived=archived):
         data = job.to_dict()
         results.append(
             JobDetail(
@@ -495,9 +705,77 @@ async def list_jobs_endpoint() -> List[JobDetail]:
                 result=data.get("result"),
                 output_formats=data.get("output_formats", []),
                 downloads=data.get("downloads", {}),
+                group_id=data.get("group_id"),
+                archived=data.get("archived", False),
             )
         )
     return results
+
+
+@app.get("/api/groups/{group_id}")
+async def get_group(group_id: str) -> Dict[str, Any]:
+    await _refresh_group(group_id)
+    meta = _get_group_info(group_id)
+    combined_path = GROUP_DIR / group_id / "combined.txt"
+    combined_text = ""
+    if combined_path.exists():
+        combined_text = combined_path.read_text(encoding="utf-8")
+
+    jobs_payload: list[Dict[str, Any]] = []
+    for job_id in meta.get("job_ids", []):
+        job = job_manager.get_job(job_id)
+        if not job:
+            continue
+        jobs_payload.append(
+            {
+                "id": job.id,
+                "filename": job.filename,
+                "status": job.status,
+                "progress": job.progress,
+                "archived": job.archived,
+            }
+        )
+
+    return {
+        "id": group_id,
+        "jobs": jobs_payload,
+        "combined_text": combined_text,
+        "complete": meta.get("complete", False),
+        "downloads": meta.get("downloads", {}),
+        "created_at": meta.get("created_at"),
+        "updated_at": meta.get("updated_at"),
+        "job_ids": meta.get("job_ids", []),
+    }
+
+
+@app.get("/api/groups/{group_id}/download/{fmt}")
+async def download_group(group_id: str, fmt: str) -> FileResponse:
+    fmt = fmt.lower()
+    if fmt != "txt":
+        raise HTTPException(status_code=404, detail="Format not available")
+    combined_path = GROUP_DIR / group_id / "combined.txt"
+    if not combined_path.exists():
+        raise HTTPException(status_code=404, detail="Combined transcript not found")
+    filename = f"combined-{group_id[:8]}.txt"
+    return FileResponse(combined_path, filename=filename, media_type="text/plain")
+
+
+@app.post("/api/jobs/{job_id}/archive")
+async def archive_job_endpoint(job_id: str) -> Dict[str, Any]:
+    await _archive_job(job_id)
+    return {"status": "archived"}
+
+
+@app.post("/api/jobs/{job_id}/unarchive")
+async def unarchive_job_endpoint(job_id: str) -> Dict[str, Any]:
+    await _unarchive_job(job_id)
+    return {"status": "active"}
+
+
+@app.post("/api/jobs/archive-completed")
+async def archive_completed_endpoint() -> Dict[str, Any]:
+    count = await _archive_completed_jobs()
+    return {"archived": count}
 
 
 @app.get("/api/jobs/{job_id}", response_model=JobDetail)
@@ -518,6 +796,8 @@ async def get_job(job_id: str) -> JobDetail:
         result=data.get("result"),
         output_formats=data.get("output_formats", []),
         downloads=data.get("downloads", {}),
+        group_id=data.get("group_id"),
+        archived=data.get("archived", False),
     )
 
 

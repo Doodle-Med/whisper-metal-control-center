@@ -24,6 +24,8 @@ class JobSummary(BaseModel):
     created_at: datetime
     updated_at: datetime
     error: Optional[str] = None
+    group_id: Optional[str] = None
+    archived: bool = False
 
 
 class JobDetail(JobSummary):
@@ -57,4 +59,6 @@ def job_to_summary(payload: Dict[str, Any]) -> JobSummary:
         created_at=datetime.fromisoformat(payload["created_at"]),
         updated_at=datetime.fromisoformat(payload["updated_at"]),
         error=payload.get("error"),
+        group_id=payload.get("group_id"),
+        archived=payload.get("archived", False),
     )

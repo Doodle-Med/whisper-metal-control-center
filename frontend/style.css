@@ -76,6 +76,12 @@ html, body {
   margin-bottom: 1.25rem;
 }
 
+.panel-actions {
+  display: flex;
+  gap: 0.6rem;
+  flex-wrap: wrap;
+}
+
 fieldset {
   border: 1px solid rgba(148, 163, 184, 0.2);
   border-radius: 14px;
@@ -84,6 +90,11 @@ fieldset {
   display: flex;
   flex-wrap: wrap;
   gap: 1rem 1.5rem;
+}
+
+.batch-options label {
+  font-size: 0.95rem;
+  color: var(--text-muted);
 }
 
 legend {
@@ -269,6 +280,14 @@ tbody tr:hover {
 
 tbody tr.empty:hover {
   background: transparent;
+}
+
+tr.group-row td {
+  border-bottom: 1px solid rgba(99, 102, 241, 0.25);
+}
+
+tr.selected-row {
+  background: rgba(99, 102, 241, 0.18);
 }
 
 .status-badge {

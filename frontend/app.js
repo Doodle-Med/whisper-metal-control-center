@@ -1,8 +1,11 @@
 const state = {
   capabilities: null,
   jobs: [],
+  groups: {},
   pollHandle: null,
   selectedJobId: null,
+  selectedGroupId: null,
+  showArchived: false,
   mediaRecorder: null,
   recordedChunks: [],
 };
@@ -28,6 +31,7 @@ const promptInput = document.getElementById("promptInput");
 const cloudOptions = document.getElementById("cloudOptions");
 const cloudModelInput = document.getElementById("cloudModelInput");
 const cloudKeyInput = document.getElementById("cloudKeyInput");
+const combineToggle = document.getElementById("combineToggle");
 const dropzone = document.getElementById("dropzone");
 const fileInput = document.getElementById("fileInput");
 const browseButton = document.getElementById("browseButton");
@@ -36,6 +40,8 @@ const startButton = document.getElementById("startButton");
 const recordButton = document.getElementById("recordButton");
 const statusMessage = document.getElementById("statusMessage");
 const refreshJobsButton = document.getElementById("refreshJobsButton");
+const archiveCompletedButton = document.getElementById("archiveCompletedButton");
+const toggleArchivedButton = document.getElementById("toggleArchivedButton");
 const jobTableBody = document.getElementById("jobTableBody");
 const transcriptTitle = document.getElementById("transcriptTitle");
 const transcriptMeta = document.getElementById("transcriptMeta");
@@ -76,6 +82,8 @@ function attachEventListeners() {
   dropzone.addEventListener("dragleave", () => dropzone.classList.remove("dragover"));
   dropzone.addEventListener("drop", handleDrop);
   refreshJobsButton.addEventListener("click", refreshJobs);
+  archiveCompletedButton.addEventListener("click", archiveCompletedJobs);
+  toggleArchivedButton.addEventListener("click", toggleArchivedView);
   jobTableBody.addEventListener("click", handleJobTableClick);
   recordButton.addEventListener("click", handleRecordButton);
 }
@@ -228,6 +236,7 @@ async function handleSubmit(event) {
   formData.append("tinydiarize", tinydiarizeToggle.checked);
   formData.append("no_timestamps", noTimestampsToggle.checked);
   formData.append("detect_language", detectLanguageToggle.checked);
+  formData.append("combine", combineToggle.checked);
 
   const cleaners = ["collapse_spaces"];
   if (cleanFillersToggle.checked) cleaners.push("remove_fillers");
@@ -252,11 +261,24 @@ async function handleSubmit(event) {
       throw new Error(error.detail || response.statusText);
     }
 
-    const jobs = await response.json();
+    const payload = await response.json();
+    const jobs = Array.isArray(payload) ? payload : payload.jobs || [];
+    const groupInfo = !Array.isArray(payload) ? payload.group : null;
+
     showStatus(`Queued ${jobs.length} job(s).`, "success");
     updateQueuedFileList();
     fileInput.value = "";
     await refreshJobs();
+
+    if (groupInfo && groupInfo.id) {
+      state.groups[groupInfo.id] = {
+        id: groupInfo.id,
+        job_ids: groupInfo.job_ids || [],
+        downloads: groupInfo.downloads || {},
+      };
+      await fetchGroup(groupInfo.id);
+      await selectGroup(groupInfo.id, { silent: true });
+    }
   } catch (error) {
     console.error(error);
     showStatus(`Failed to queue jobs: ${error.message || error}`, "error");
@@ -267,14 +289,23 @@ async function handleSubmit(event) {
 
 async function refreshJobs() {
   try {
-    const response = await fetch("/api/jobs");
+    const response = await fetch(`/api/jobs?archived=${state.showArchived ? "true" : "false"}`);
     if (!response.ok) throw new Error("Failed to fetch jobs");
     state.jobs = await response.json();
+    syncGroupsFromJobs();
+    toggleArchivedButton.textContent = state.showArchived ? "Show Active" : "Show Archived";
+    archiveCompletedButton.disabled = state.showArchived;
     renderJobs();
+    await refreshGroups();
     if (state.selectedJobId) {
       const job = state.jobs.find((item) => item.id === state.selectedJobId);
       if (job && job.status === "completed") {
         await selectJob(job.id, { silent: true });
+      }
+    } else if (state.selectedGroupId) {
+      const group = state.groups[state.selectedGroupId];
+      if (group) {
+        renderGroupViewer();
       }
     }
   } catch (error) {
@@ -283,22 +314,104 @@ async function refreshJobs() {
   }
 }
 
+function syncGroupsFromJobs() {
+  state.jobs.forEach((job) => {
+    const groupId = job.group_id;
+    if (!groupId) return;
+    if (!state.groups[groupId]) {
+      state.groups[groupId] = { id: groupId, jobs: [], job_ids: [] };
+    }
+  });
+}
+
 function renderJobs() {
   jobTableBody.innerHTML = "";
-  if (!state.jobs.length) {
+  const fragment = document.createDocumentFragment();
+
+  const groupEntries = Object.entries(state.groups)
+    .filter(([groupId, group]) => {
+      if (!group) return false;
+      const jobs = group.jobs || [];
+      if (!jobs.length) {
+        // Placeholder entry while the group metadata loads; surface it only in the active view.
+        return !state.showArchived;
+      }
+      const hasArchived = jobs.some((job) => job.archived);
+      const hasActive = jobs.some((job) => !job.archived);
+      return state.showArchived ? hasArchived : hasActive;
+    })
+    .sort(([, a], [, b]) => {
+      const aTime = new Date(a.updated_at || a.created_at || 0).getTime();
+      const bTime = new Date(b.updated_at || b.created_at || 0).getTime();
+      return bTime - aTime;
+    });
+
+  groupEntries.forEach(([groupId, group]) => {
     const row = document.createElement("tr");
-    row.className = "empty";
-    const cell = document.createElement("td");
-    cell.colSpan = 4;
-    cell.textContent = "Queue is empty.";
-    row.appendChild(cell);
-    jobTableBody.appendChild(row);
-    return;
-  }
+    row.className = "group-row";
+    if (state.selectedGroupId === groupId) row.classList.add("selected-row");
+    row.dataset.groupId = groupId;
+    row.dataset.type = "group";
+
+    const jobCount = (group.jobs && group.jobs.length) || group.job_ids?.length || 0;
+    const jobCell = document.createElement("td");
+    jobCell.innerHTML = `<strong>Combined Transcript</strong><br><small>${jobCount} files • ${groupId.slice(0, 8)}</small>`;
+
+    const statusCell = document.createElement("td");
+    const badge = document.createElement("span");
+    badge.className = "status-badge";
+    badge.dataset.state = group.complete ? "completed" : "running";
+    badge.textContent = group.complete ? "COMPLETED" : "IN PROGRESS";
+    statusCell.appendChild(badge);
+
+    const progressCell = document.createElement("td");
+    const progressBar = document.createElement("div");
+    progressBar.className = "progress";
+    const progressInner = document.createElement("span");
+    const progressValue = computeGroupProgress(group);
+    progressInner.style.width = `${progressValue}%`;
+    progressBar.appendChild(progressInner);
+    const progressLabel = document.createElement("div");
+    progressLabel.textContent = `${progressValue}%`;
+    progressLabel.style.fontSize = "0.8rem";
+    progressLabel.style.marginTop = "0.35rem";
+    progressLabel.style.color = "var(--text-muted)";
+    progressCell.appendChild(progressBar);
+    progressCell.appendChild(progressLabel);
+
+    const actionCell = document.createElement("td");
+    const actions = document.createElement("div");
+    actions.className = "row-actions";
+    const viewButton = document.createElement("button");
+    viewButton.type = "button";
+    viewButton.className = "secondary view-group";
+    viewButton.dataset.groupId = groupId;
+    viewButton.textContent = "View Combined";
+    actions.appendChild(viewButton);
+
+    if (group.downloads) {
+      Object.entries(group.downloads).forEach(([fmt, url]) => {
+        const link = document.createElement("a");
+        link.href = url;
+        link.target = "_blank";
+        link.rel = "noopener";
+        link.textContent = fmt.toUpperCase();
+        actions.appendChild(link);
+      });
+    }
+
+    actionCell.appendChild(actions);
+    row.appendChild(jobCell);
+    row.appendChild(statusCell);
+    row.appendChild(progressCell);
+    row.appendChild(actionCell);
+    fragment.appendChild(row);
+  });
 
   state.jobs.forEach((job) => {
     const row = document.createElement("tr");
     row.dataset.jobId = job.id;
+    if (state.selectedJobId === job.id) row.classList.add("selected-row");
 
     const jobCell = document.createElement("td");
     jobCell.innerHTML = `<strong>${job.filename}</strong><br><small>${job.id.slice(0, 8)} • ${job.engine}</small>`;
@@ -342,6 +455,20 @@ function renderJobs() {
       cancelButton.dataset.jobId = job.id;
       cancelButton.textContent = "Cancel";
       actions.appendChild(cancelButton);
+    } else if (job.status === "completed" && !job.archived) {
+      const archiveButton = document.createElement("button");
+      archiveButton.type = "button";
+      archiveButton.className = "secondary archive-job";
+      archiveButton.dataset.jobId = job.id;
+      archiveButton.textContent = "Archive";
+      actions.appendChild(archiveButton);
+    } else if (job.archived) {
+      const restoreButton = document.createElement("button");
+      restoreButton.type = "button";
+      restoreButton.className = "secondary restore-job";
+      restoreButton.dataset.jobId = job.id;
+      restoreButton.textContent = "Restore";
+      actions.appendChild(restoreButton);
     }
 
     if (job.downloads && Object.keys(job.downloads).length) {
@@ -361,8 +488,20 @@ function renderJobs() {
     row.appendChild(statusCell);
     row.appendChild(progressCell);
     row.appendChild(actionCell);
-    jobTableBody.appendChild(row);
+    fragment.appendChild(row);
   });
+
+  if (!fragment.childNodes.length) {
+    const row = document.createElement("tr");
+    row.className = "empty";
+    const cell = document.createElement("td");
+    cell.colSpan = 4;
+    cell.textContent = state.showArchived ? "No archived jobs." : "Queue is empty.";
+    row.appendChild(cell);
+    fragment.appendChild(row);
+  }
+
+  jobTableBody.appendChild(fragment);
 }
 
 async function handleJobTableClick(event) {
@@ -370,13 +509,25 @@ async function handleJobTableClick(event) {
   if (target.matches(".view-job")) {
     const jobId = target.dataset.jobId;
     await selectJob(jobId);
+  } else if (target.matches(".view-group")) {
+    const groupId = target.dataset.groupId || target.closest("tr")?.dataset.groupId;
+    if (groupId) {
+      await selectGroup(groupId);
+    }
   } else if (target.matches(".cancel-job")) {
     const jobId = target.dataset.jobId;
     await cancelJob(jobId);
+  } else if (target.matches(".archive-job")) {
+    const jobId = target.dataset.jobId;
+    await archiveJob(jobId);
+  } else if (target.matches(".restore-job")) {
+    const jobId = target.dataset.jobId;
+    await unarchiveJob(jobId);
   }
 }
 
 async function selectJob(jobId, { silent = false } = {}) {
+  state.selectedGroupId = null;
   try {
     const response = await fetch(`/api/jobs/${jobId}`);
     if (!response.ok) throw new Error("Unable to fetch job");
@@ -393,6 +544,7 @@ async function selectJob(jobId, { silent = false } = {}) {
 }
 
 function renderTranscript(job) {
+  state.selectedGroupId = null;
   transcriptTitle.textContent = job.filename;
   transcriptMeta.textContent = `${job.status.toUpperCase()} • Job ${job.id.slice(0, 8)}`;
 
@@ -460,6 +612,143 @@ function showStatus(message, tone = "info") {
   statusMessage.dataset.tone = tone;
 }
 
+async function refreshGroups() {
+  const groupIds = Object.keys(state.groups);
+  if (!groupIds.length) return;
+  await Promise.all(
+    groupIds.map(async (groupId) => {
+      try {
+        await fetchGroup(groupId);
+      } catch (error) {
+        console.error(error);
+      }
+    }),
+  );
+  if (state.selectedGroupId) {
+    renderGroupViewer();
+  }
+}
+
+async function fetchGroup(groupId) {
+  const response = await fetch(`/api/groups/${groupId}`);
+  if (!response.ok) {
+    if (response.status === 404) {
+      delete state.groups[groupId];
+      if (state.selectedGroupId === groupId) {
+        state.selectedGroupId = null;
+        transcriptOutput.textContent = "Combined transcript unavailable.";
+      }
+    }
+    return null;
+  }
+  const payload = await response.json();
+  state.groups[groupId] = payload;
+  return payload;
+}
+
+function computeGroupProgress(group) {
+  const jobs = group?.jobs || [];
+  if (!jobs.length) return 0;
+  const total = jobs.reduce((sum, job) => sum + (job.progress ?? 0), 0);
+  return Math.round(total / jobs.length);
+}
+
+async function selectGroup(groupId, { silent = false } = {}) {
+  state.selectedJobId = null;
+  const group = (await fetchGroup(groupId)) || state.groups[groupId];
+  if (!group) {
+    if (!silent) showStatus("Combined transcript not found.", "error");
+    return;
+  }
+  state.selectedGroupId = groupId;
+  renderGroupViewer();
+  if (!silent) {
+    showStatus(`Loaded combined transcript (${group.jobs?.length || 0} files).`, "success");
+  }
+}
+
+function renderGroupViewer() {
+  const group = state.groups[state.selectedGroupId];
+  if (!group) return;
+
+  const total = group.jobs?.length || group.job_ids?.length || 0;
+  const completed = (group.jobs || []).filter((job) => job.status === "completed").length;
+  transcriptTitle.textContent = "Combined Transcript";
+  transcriptMeta.textContent = `Group ${state.selectedGroupId.slice(0, 8)} • ${completed}/${total} completed`;
+
+  const text = group.combined_text || "";
+  transcriptOutput.textContent = text || (group.complete ? "No transcripts available." : "Waiting for jobs to finish…");
+
+  downloadButtons.innerHTML = "";
+  if (group.downloads) {
+    Object.entries(group.downloads).forEach(([fmt, url]) => {
+      const link = document.createElement("a");
+      link.href = url;
+      link.target = "_blank";
+      link.rel = "noopener";
+      link.textContent = fmt.toUpperCase();
+      downloadButtons.appendChild(link);
+    });
+  }
+
+  segmentsContainer.innerHTML = "";
+  (group.jobs || []).forEach((job) => {
+    const card = document.createElement("div");
+    card.className = "segment-card";
+    const title = document.createElement("div");
+    title.innerHTML = `<strong>${job.filename}</strong>`;
+    const status = document.createElement("time");
+    status.textContent = `Status: ${job.status.toUpperCase()} (${job.progress ?? 0}%)`;
+    card.appendChild(title);
+    card.appendChild(status);
+    segmentsContainer.appendChild(card);
+  });
+}
+
+async function archiveCompletedJobs() {
+  try {
+    const response = await fetch("/api/jobs/archive-completed", { method: "POST" });
+    if (!response.ok) throw new Error("Archive request failed");
+    const payload = await response.json();
+    showStatus(`Archived ${payload.archived ?? 0} job(s).`, "success");
+    await refreshJobs();
+  } catch (error) {
+    console.error(error);
+    showStatus(`Archive failed: ${error.message || error}`, "error");
+  }
+}
+
+function toggleArchivedView() {
+  state.showArchived = !state.showArchived;
+  state.selectedJobId = null;
+  state.selectedGroupId = null;
+  refreshJobs();
+}
+
+async function archiveJob(jobId) {
+  try {
+    const response = await fetch(`/api/jobs/${jobId}/archive`, { method: "POST" });
+    if (!response.ok) throw new Error("Archive request failed");
+    showStatus(`Archived job ${jobId.slice(0, 8)}.`, "success");
+    await refreshJobs();
+  } catch (error) {
+    console.error(error);
+    showStatus(`Failed to archive job: ${error.message || error}`, "error");
+  }
+}
+
+async function unarchiveJob(jobId) {
+  try {
+    const response = await fetch(`/api/jobs/${jobId}/unarchive`, { method: "POST" });
+    if (!response.ok) throw new Error("Unarchive request failed");
+    showStatus(`Restored job ${jobId.slice(0, 8)}.`, "success");
+    await refreshJobs();
+  } catch (error) {
+    console.error(error);
+    showStatus(`Failed to restore job: ${error.message || error}`, "error");
+  }
+}
+
 async function handleRecordButton() {
   if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
     showStatus("Recording not supported in this browser.", "warn");
@@ -495,4 +784,3 @@ async function handleRecordButton() {
     state.mediaRecorder.stop();
   }
 }
-

@@ -91,6 +91,11 @@
         <label><input type="checkbox" class="formatToggle" value="json" checked> JSON</label>
       </fieldset>
 
+      <fieldset class="batch-options">
+        <legend>Batch Options</legend>
+        <label><input type="checkbox" id="combineToggle"> Combine transcripts into a single output</label>
+      </fieldset>
+
       <div class="grid two" id="cloudOptions" hidden>
         <label class="field">
           <span>Cloud Model</span>
@@ -121,7 +126,11 @@
     <section class="panel" id="queuePanel">
       <header class="panel-header">
         <h2>Job Queue</h2>
-        <button type="button" id="refreshJobsButton">Refresh</button>
+        <div class="panel-actions">
+          <button type="button" id="archiveCompletedButton" class="secondary">Archive Completed</button>
+          <button type="button" id="toggleArchivedButton" class="secondary">Show Archived</button>
+          <button type="button" id="refreshJobsButton">Refresh</button>
+        </div>
       </header>
       <div class="table-wrapper">
         <table>

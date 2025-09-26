@@ -8,6 +8,8 @@ A local-first transcription workstation for Apple Silicon. Audio stays on-device
 - 🎯 **Decoding controls** – choose models, beam search, best-of, temperature, prompts, timestamps, diarization, VAD, and automatic filler-word cleanup.
 - 🔁 **Live progress tracking** fed by whisper.cpp’ s internal progress callback, surfaced in the UI with status badges and progress bars.
 - 📦 **One-click exports** – download TXT, SRT, VTT, or JSON artefacts for every job.
+- 🧩 **Batch combine option** – merge multi-file uploads into a single, ordered transcript with filename separators.
+- 🗃️ **Archive workflow** – sweep completed jobs into cold storage to keep the queue lean while preserving downloads.
 - ☁️ **Cloud offload option** – point the job at OpenAI’s Whisper API (Gemini stub included) by pasting an API key; handy when you need to chew through huge queues.
 - 🎙️ **Inline recorder** – capture a quick note directly from the browser.
 
@@ -55,6 +57,17 @@ make clean-storage
 ```
 
 On macOS you can also run `./scripts/start_whisper.command` to launch everything from Terminal.
+
+### Combining transcripts & archiving
+
+- Tick **Combine transcripts into a single output** when uploading to merge every
+  file from the batch into a single transcript panel. Each section is separated
+  by the source filename, and the combined output stays available via the
+  *Combined Transcript* row in the queue.
+- Use **Archive Completed** (or the per-row *Archive* button) to move finished
+  jobs into cold storage. Toggle between active and archived jobs with
+  *Show Archived*; archived jobs retain their downloads and can be restored at
+  any time.
 
 ## Configuration
 The backend reads environment variables with the `WHISPER_APP_` prefix. Useful knobs:
@@ -106,6 +119,8 @@ Static assets live in `frontend/` and are served directly by FastAPI. Highlights
 - **Engine selector** toggles between local Metal execution and OpenAI/Gemini offload (key supplied per request).
 - **Quality presets** adjust beam search, best-of, and temperature in one click.
 - **Advanced toggles** enable diarization, TinyDiarize, VAD (with optional Silero model), timestamp suppression, translation, and filler-word scrubbing.
+- **Batch combine** switch bundles every file in a multi-upload into a single transcript box with filename dividers—perfect for rapid copy/paste.
+- **Archive controls** move completed jobs out of the active queue (one-click “Archive completed” or per-job archive/restore) while keeping artefacts downloadable from the archive view.
 - **Job queue** shows progress bars fed by whisper.cpp’ s progress callback. You can cancel or reopen finished transcripts without re-running them.
 - **Transcript viewer** renders the full text, timestamps, and segments, and surfaces download buttons for TXT/SRT/VTT/JSON.
 - **Recorder** captures a quick voice memo using the MediaRecorder API and drops it into the queue.
@@ -132,6 +147,13 @@ easy one-click installs.
 Recipients simply mount the DMG, drag the folder anywhere, and double-click the
 launcher. The terminal window that opens handles the first-time bootstrap and
 starts the server before opening the UI in the default browser.
+
+### Toward a standalone app (Phase 3)
+
+Phase 3 will turn this into a fully self-contained macOS app bundle (no manual
+Python/ffmpeg installs). The high-level plan—embedding the Python runtime,
+bundling whisper.cpp, and generating a `.app` + notarised DMG—is tracked in
+`docs/standalone-roadmap.md`.
 
 ## Tips & troubleshooting
 - **Metal build issues** → ensure the Xcode Command Line Tools are installed and re-run `./scripts/setup_whisper_cpp.sh`.
