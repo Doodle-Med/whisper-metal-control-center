@@ -30,16 +30,20 @@ def configure_environment() -> tuple[Path, Path, Path]:
     os.environ.setdefault("PYTHONUNBUFFERED", "1")
     os.environ.setdefault("WHISPER_APP_STORAGE_DIR", str(storage_root / "storage"))
     os.environ.setdefault("WHISPER_APP_WHISPER_ROOT", str(vendor_root))
+
+    # Expose user models directory to backend for listing
+    user_models_dir = storage_root / "models"
+    user_models_dir.mkdir(parents=True, exist_ok=True)
+    os.environ["WHISPER_APP_USER_MODELS_DIR"] = str(user_models_dir)
+
     binary_path = vendor_root / "build" / "bin" / "whisper-cli"
     if binary_path.exists():
         os.environ.setdefault("WHISPER_APP_WHISPER_BINARY", str(binary_path))
+
+    # If a bundled base model exists (future), prefer it unless user override is set during runtime
     base_model = vendor_root / "models" / "ggml-base.en.bin"
     if base_model.exists():
         os.environ.setdefault("WHISPER_APP_WHISPER_MODEL", str(base_model))
-
-    ffmpeg_binary = resources_root / "bin" / "ffmpeg"
-    if ffmpeg_binary.exists():
-        os.environ["PATH"] = f"{ffmpeg_binary.parent}:{os.environ.get('PATH', '')}"
 
     # Ensure bundled backend/frontends are importable
     sys.path.insert(0, str(project_root))
@@ -58,8 +62,37 @@ def _download_file(url: str, destination: Path, chunk_size: int = 1024 * 1024) -
                     file_handle.write(chunk)
 
 
-def ensure_base_model(vendor_root: Path, model_name: str = "ggml-base.en.bin") -> Optional[Path]:
-    # Always download to a writable per-user location so it works even when launching from a read-only DMG
+def _try_urls(urls: list[str], out_path: Path) -> bool:
+    for url in urls:
+        try:
+            _download_file(url, out_path)
+            return True
+        except Exception:
+            continue
+    return out_path.exists()
+
+
+MODEL_MAP = {
+    "ggml-base.en.bin": [
+        "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin?download=true",
+        "https://ggml.ggerganov.com/whisper/ggml-base.en.bin",
+    ],
+    "ggml-small.en.bin": [
+        "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.en.bin?download=true",
+        "https://ggml.ggerganov.com/whisper/ggml-small.en.bin",
+    ],
+    "ggml-medium.en.bin": [
+        "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-medium.en.bin?download=true",
+        "https://ggml.ggerganov.com/whisper/ggml-medium.en.bin",
+    ],
+    "ggml-large-v3.bin": [
+        "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3.bin?download=true",
+        "https://ggml.ggerganov.com/whisper/ggml-large-v3.bin",
+    ],
+}
+
+
+def ensure_models(vendor_root: Path) -> Optional[Path]:
     user_models_dir = (
         Path.home()
         / "Library"
@@ -67,42 +100,28 @@ def ensure_base_model(vendor_root: Path, model_name: str = "ggml-base.en.bin") -
         / "WhisperMetalControlCenter"
         / "models"
     )
-    model_path = user_models_dir / model_name
-    if model_path.exists():
-        return model_path
+    user_models_dir.mkdir(parents=True, exist_ok=True)
 
-    # Try to download from known mirrors. We prefer Hugging Face; fall back to ggml mirror.
-    candidate_urls = [
-        f"https://huggingface.co/ggerganov/whisper.cpp/resolve/main/{model_name}?download=true",
-        f"https://ggml.ggerganov.com/whisper/{model_name}",
-    ]
+    # Download base model first to unblock UI quickly
+    base_path = user_models_dir / "ggml-base.en.bin"
+    if not base_path.exists():
+        _try_urls(MODEL_MAP["ggml-base.en.bin"], base_path)
 
-    for url in candidate_urls:
-        try:
-            _download_file(url, model_path)
-            break
-        except Exception:
-            # Try the next mirror
-            continue
+    # Kick off background downloads for other models (non-blocking)
+    def _bg_download() -> None:
+        for name, urls in MODEL_MAP.items():
+            if name == "ggml-base.en.bin":
+                continue
+            out = user_models_dir / name
+            if out.exists():
+                continue
+            _try_urls(urls, out)
 
-    if not model_path.exists():
-        # As a last resort, try the bundled shell helper if present
-        helper = vendor_root / "models" / "download-ggml-model.sh"
-        if helper.exists():
-            try:
-                import subprocess
+    threading.Thread(target=_bg_download, name="model-downloader", daemon=True).start()
 
-                subprocess.run(
-                    ["bash", str(helper), "base.en"],
-                    check=True,
-                    cwd=str(user_models_dir),
-                )
-            except Exception:
-                pass
-
-    if model_path.exists():
-        os.environ["WHISPER_APP_WHISPER_MODEL"] = str(model_path)
-        return model_path
+    if base_path.exists():
+        os.environ["WHISPER_APP_WHISPER_MODEL"] = str(base_path)
+        return base_path
     return None
 
 
@@ -157,10 +176,9 @@ class BackendServer:
 def main() -> None:
     resources_root, project_root, vendor_root = configure_environment()
 
-    # Ensure a minimal model is present so the app works out of the box. If download fails,
-    # the app will still launch; the user can point to a model later.
+    # Ensure base model first, then background download others
     with contextlib.suppress(Exception):
-        ensure_base_model(vendor_root)
+        ensure_models(vendor_root)
 
     backend = BackendServer()
     backend.start()
