@@ -59,8 +59,15 @@ def _download_file(url: str, destination: Path, chunk_size: int = 1024 * 1024) -
 
 
 def ensure_base_model(vendor_root: Path, model_name: str = "ggml-base.en.bin") -> Optional[Path]:
-    models_dir = vendor_root / "models"
-    model_path = models_dir / model_name
+    # Always download to a writable per-user location so it works even when launching from a read-only DMG
+    user_models_dir = (
+        Path.home()
+        / "Library"
+        / "Application Support"
+        / "WhisperMetalControlCenter"
+        / "models"
+    )
+    model_path = user_models_dir / model_name
     if model_path.exists():
         return model_path
 
@@ -80,17 +87,21 @@ def ensure_base_model(vendor_root: Path, model_name: str = "ggml-base.en.bin") -
 
     if not model_path.exists():
         # As a last resort, try the bundled shell helper if present
-        helper = models_dir / "download-ggml-model.sh"
+        helper = vendor_root / "models" / "download-ggml-model.sh"
         if helper.exists():
             try:
                 import subprocess
 
-                subprocess.run(["bash", str(helper), "base.en"], check=True, cwd=str(models_dir))
+                subprocess.run(
+                    ["bash", str(helper), "base.en"],
+                    check=True,
+                    cwd=str(user_models_dir),
+                )
             except Exception:
                 pass
 
     if model_path.exists():
-        os.environ.setdefault("WHISPER_APP_WHISPER_MODEL", str(model_path))
+        os.environ["WHISPER_APP_WHISPER_MODEL"] = str(model_path)
         return model_path
     return None
 
