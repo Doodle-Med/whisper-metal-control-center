@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import json
-import shutil
 import os
+import shutil
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -16,7 +16,7 @@ from fastapi.staticfiles import StaticFiles
 
 from . import audio
 from .cloud import CloudTranscriptionError, transcribe_gemini, transcribe_openai
-from .config import settings
+from .config import DEFAULT_MODEL_NAME, settings
 from .jobs import job_manager
 from .model_downloader import ModelDownloadManager, MODEL_SOURCES
 from .models import CapabilityResponse, JobDetail, JobStatus, JobSummary, ModelInfo
@@ -100,6 +100,7 @@ async def startup_event() -> None:
     global model_manager
 
     settings.storage_dir.mkdir(parents=True, exist_ok=True)
+    settings.models_dir.mkdir(parents=True, exist_ok=True)
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     JOB_DIR.mkdir(parents=True, exist_ok=True)
     ARCHIVE_JOBS_DIR.mkdir(parents=True, exist_ok=True)
@@ -107,14 +108,22 @@ async def startup_event() -> None:
 
     # Initialize model manager with both vendor and per-user paths
     search_dirs = [settings.models_dir]
-    user_models_dir_env = os.environ.get("WHISPER_APP_USER_MODELS_DIR")
-    if user_models_dir_env:
-        search_dirs.append(Path(user_models_dir_env).expanduser())
-    download_dir = (
-        Path(user_models_dir_env).expanduser()
-        if user_models_dir_env
-        else settings.models_dir
-    )
+    bundle_models = settings.bundle_models_dir
+    if bundle_models is not None:
+        search_dirs.append(bundle_models)
+
+    download_dir = settings.models_dir
+
+    if bundle_models is not None:
+        bundle_base = bundle_models / DEFAULT_MODEL_NAME
+        download_base = download_dir / DEFAULT_MODEL_NAME
+        try:
+            if bundle_base.exists() and not download_base.exists():
+                download_base.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(bundle_base, download_base)
+        except OSError:
+            pass
+
     model_manager = ModelDownloadManager(
         search_dirs=[path for path in search_dirs if path],
         download_dir=download_dir,
@@ -567,7 +576,7 @@ def _write_srt(path: Path, segments: List[Dict[str, Any]]) -> None:
         start = _format_timestamp(seg.get("start"))
         end = _format_timestamp(seg.get("end"))
         text = seg.get("text", "")
-        lines.extend([str(idx), f"{start} --> {end}", text, ""]) 
+        lines.extend([str(idx), f"{start} --> {end}", text, ""])
     path.write_text("\n".join(lines), encoding="utf-8")
 
 
@@ -926,6 +935,6 @@ async def delete_job_files(job_id: str) -> dict[str, str]:
 
 
 # Serve the static frontend bundle
-FRONTEND_DIR = Path(__file__).resolve().parents[2] / "frontend"
-if FRONTEND_DIR.exists():
-    app.mount("/", StaticFiles(directory=FRONTEND_DIR, html=True), name="frontend")
+_frontend_root = settings.resources_dir / "frontend"
+if _frontend_root.exists():
+    app.mount("/", StaticFiles(directory=_frontend_root, html=True), name="frontend")
