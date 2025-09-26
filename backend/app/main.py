@@ -111,24 +111,46 @@ async def health() -> dict[str, str]:
 @app.get("/api/models", response_model=List[ModelInfo])
 async def list_models() -> List[ModelInfo]:
     models: list[ModelInfo] = []
-    if not settings.models_dir.exists():
-        return models
-    for path in sorted(settings.models_dir.glob("*.bin")):
-        if path.stem.startswith("for-tests"):
-            continue
-        size_mb = round(path.stat().st_size / (1024 * 1024), 2)
-        quant = None
-        if "q" in path.stem:
-            parts = path.stem.split("-")
-            quant = parts[-1] if parts else None
-        models.append(
-            ModelInfo(
-                name=path.name,
-                path=str(path.resolve()),
-                size_mb=size_mb,
-                quantization=quant,
-            )
-        )
+    seen: set[str] = set()
+
+    # Search both the bundled vendor models directory and the per-user models directory used by the app bundle
+    search_dirs: list[Path] = []
+    if settings.models_dir.exists():
+        search_dirs.append(settings.models_dir)
+
+    user_models_env = os.environ.get("WHISPER_APP_USER_MODELS_DIR")
+    if user_models_env:
+        user_models_dir = Path(user_models_env).expanduser().resolve()
+    else:
+        user_models_dir = Path.home() / "Library" / "Application Support" / "WhisperMetalControlCenter" / "models"
+    if user_models_dir.exists():
+        search_dirs.append(user_models_dir)
+
+    for directory in search_dirs:
+        for path in sorted(directory.glob("*.bin")):
+            try:
+                if path.stem.startswith("for-tests"):
+                    continue
+                resolved = str(path.resolve())
+                if resolved in seen:
+                    continue
+                seen.add(resolved)
+                size_mb = round(path.stat().st_size / (1024 * 1024), 2)
+                quant = None
+                if "q" in path.stem:
+                    parts = path.stem.split("-")
+                    quant = parts[-1] if parts else None
+                models.append(
+                    ModelInfo(
+                        name=path.name,
+                        path=resolved,
+                        size_mb=size_mb,
+                        quantization=quant,
+                    )
+                )
+            except Exception:
+                # Skip unreadable files
+                continue
     return models
 
 
