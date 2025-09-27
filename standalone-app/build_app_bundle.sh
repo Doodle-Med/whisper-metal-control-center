@@ -10,6 +10,7 @@ BUILD_DIR="${SCRIPT_DIR}/build"
 APP_NAME="Whisper Metal Control Center.app"
 APP_BUNDLE="${DIST_DIR}/${APP_NAME}"
 RESOURCES_DIR="${APP_BUNDLE}/Contents/Resources"
+VENDOR_ROOT="${SCRIPT_DIR}/vendor/whisper.cpp"
 
 mkdir -p "${PACKAGING_DIR}"
 
@@ -22,9 +23,9 @@ pip install --upgrade pip
 pip install -r "${SCRIPT_DIR}/requirements-packaging.txt"
 pip install -r "${REPO_ROOT}/backend/requirements.txt"
 
-if [[ ! -x "${REPO_ROOT}/vendor/whisper.cpp/build/bin/whisper-cli" ]]; then
+if [[ ! -x "${VENDOR_ROOT}/build/bin/whisper-cli" ]]; then
   echo "[info] whisper.cpp build missing – running scripts/setup_whisper_cpp.sh"
-  "${REPO_ROOT}/scripts/setup_whisper_cpp.sh"
+  "${REPO_ROOT}/scripts/setup_whisper_cpp.sh" "${VENDOR_ROOT}" base.en
 fi
 
 rm -rf "${DIST_DIR}" "${BUILD_DIR}"
@@ -47,12 +48,12 @@ if [[ ! -d "${APP_BUNDLE}" ]]; then
 fi
 
 mkdir -p "${RESOURCES_DIR}/vendor/whisper.cpp"
-rsync -a --delete "${REPO_ROOT}/vendor/whisper.cpp/build" "${RESOURCES_DIR}/vendor/whisper.cpp/"
+rsync -a --delete "${VENDOR_ROOT}/build" "${RESOURCES_DIR}/vendor/whisper.cpp/"
 # Do not bundle any model files; the launcher will download on first run
 mkdir -p "${RESOURCES_DIR}/vendor/whisper.cpp/models"
 # Optionally include upstream download helper for reference
-if [[ -f "${REPO_ROOT}/vendor/whisper.cpp/models/download-ggml-model.sh" ]]; then
-  rsync -a "${REPO_ROOT}/vendor/whisper.cpp/models/download-ggml-model.sh" "${RESOURCES_DIR}/vendor/whisper.cpp/models/"
+if [[ -f "${VENDOR_ROOT}/models/download-ggml-model.sh" ]]; then
+  rsync -a "${VENDOR_ROOT}/models/download-ggml-model.sh" "${RESOURCES_DIR}/vendor/whisper.cpp/models/"
   chmod +x "${RESOURCES_DIR}/vendor/whisper.cpp/models/download-ggml-model.sh"
 fi
 

@@ -2,14 +2,10 @@
 set -euo pipefail
 
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-cd "$PROJECT_ROOT"
+TARGET_VENV_DIR="${1:-$PROJECT_ROOT/.venv}"
 
-if [[ ! -d .venv ]]; then
-  python3 -m venv .venv
-fi
-
-source .venv/bin/activate
-pip install --upgrade pip
-pip install -r backend/requirements.txt
-
-./scripts/setup_whisper_cpp.sh
+mkdir -p "$TARGET_VENV_DIR"
+python3 -m venv "$TARGET_VENV_DIR"
+source "$TARGET_VENV_DIR/bin/activate"
+python -m pip install --upgrade pip
+python -m pip install -r "$PROJECT_ROOT/backend/requirements.txt"
